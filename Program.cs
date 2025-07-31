@@ -1,485 +1,283 @@
-using Microsoft.AspNetCore.Mvc;
-using Microsoft.Azure.Functions.Worker;
+using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
-using Microsoft.Identity.Client;
-using Microsoft.Identity.Client.AppConfig;
-using SearchFrontend.Common;
-using SearchFrontend.DataSources.AzureDevOps;
-using SearchFrontend.DataSources.Bing;
-using SearchFrontend.DataSources.GPT;
-using SearchFrontend.DataSources.Interface;
-using SearchFrontend.DataSources.Nirvana;
-using SearchFrontend.DataSources.QnAMaker;
-using SearchFrontend.Endpoints.Completions;
-using SearchFrontend.Endpoints.Score;
-using SearchFrontend.Providers.AzureDevOps;
-using SearchFrontend.Providers.Bing;
-using SearchFrontend.Providers.GPT;
-using SearchFrontend.Providers.Interface;
-using SearchFrontend.Providers.Nirvana;
-using ProviderLibrary.AuthenticationProvider.Abstractions;
-using ProviderLibrary.AuthenticationProvider.Implementations;
-using ProvidersLibrary.HTTPProviders.Implementations;
-using ProviderLibrary.HTTPProviders.Abstractions;
-using ProviderLibrary.DataProviders.Implementations;
-using ProviderLibrary.DataProviders.Abstractions;
-using SearchFrontend.Endpoints.CriEscalationAdvisor;
+using Microsoft.Extensions.Options;
+using SearchFrontend.Application.Services;
+using SearchFrontend.Domain.Interfaces;
+using SearchFrontend.Infrastructure.Configuration;
+using SearchFrontend.Infrastructure.Repositories;
 using ProvidersLibrary.DataProviders.Implementations;
-using BotLibrary.Interactions;
-using Microsoft.Bot.Builder.Integration.AspNet.Core;
-using SearchFrontend.Providers.Ai;
-using ProvidersLibrary.DataProviders.Abstractions;
-using SearchFrontend.Providers.FileStore;
-using SearchFrontend.Endpoints.CriHealthSnapshot.Services;
-using SearchFrontend.Endpoints.GraphRAG;
-using Clc.Common.Repositories;
-using Clc.Common.Entities;
-
-//using Azure.Core;
-//using Azure.Identity;
-using SearchFrontend.Endpoints.InputBlock.CaseAnalysisTool;
-using Azure.Core;
-using Azure.Identity;
-using Clc.Common.Helpers;
-
-var environment = ConfigHelper.GetVariable<string>("AZURE_FUNCTIONS_ENVIRONMENT");
+using ProviderLibrary.AuthenticationProvider.Abstractions;
+using ProviderLibrary.HTTPProviders.Abstractions;
+using SearchFrontend.Providers.GPT;
+using System;
+using System.ComponentModel.DataAnnotations;
+using Microsoft.Extensions.Diagnostics.HealthChecks;
+using SearchFrontend.Domain.Models;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
 
 var host = new HostBuilder()
-    .ConfigureFunctionsWebApplication()
-    .ConfigureServices(services =>
+    .ConfigureFunctionsWorkerDefaults()
+    .ConfigureAppConfiguration((context, config) =>
     {
-
-        // Set debug mode based on environment variable
-        bool isDebugMode = ConfigHelper.GetVariable<bool>("DEBUG_MODE", false);
-        string VaultUrl = ConfigHelper.GetVariable<string>("PMEKeyVaultURI");
-        KeyVaultHelperService keyVaultService;
-        if (isDebugMode)
-        {
-            keyVaultService = new KeyVaultHelperService(VaultUrl, ConfigHelper.GetVariable<string>("BearerToken"), true);
-        }
-        else
-        {
-            keyVaultService = new KeyVaultHelperService(VaultUrl, ConfigHelper.GetVariable<string>("ManagedIdentityId"));
-        }
-
-
-        // Initialize managed identity application for managed identity authentication
-        string identityId = ConfigHelper.GetVariable<string>("ManagedIdentityId");
-        var managedIdentityApplication = ManagedIdentityApplicationBuilder
-            .Create(ManagedIdentityId.WithUserAssignedClientId(identityId))
-            .Build();
-
-        var providers = new Dictionary<string, IAuthenticationProvider>();
-        var sp_corp_authProvider = new ConfidentialClientAuthenticationProvider(
-                ConfidentialClientApplicationBuilder.Create(ConfigHelper.GetVariable<string>("SP_SUPPORTABILITY_CLIENT_ID"))
-                    .WithCertificate(keyVaultService.GetCertificateAsync(ConfigHelper.GetVariable<string>("KeyVaultCertificateName")).Result, true)
-                    .WithTenantId(ConfigHelper.GetVariable<string>("TenantID"))
-                    .Build());
-        providers[CommonConstants.AuthenticationProviders.SQL_UDP_REPOSITORY_PROVIDER] = sp_corp_authProvider;
-        providers[CommonConstants.AuthenticationProviders.ZEBRA_AI_PROVIDER] = sp_corp_authProvider;
-
-
-        if (environment == "Development")
-        {
-            // Initialize required AuthProviders for each service type
-            var sp_pme_authProvider = new ConfidentialClientAuthenticationProvider(
-                ConfidentialClientApplicationBuilder.Create(ConfigHelper.GetVariable<string>("SP_SUPPORTABILITY_CLIENT_ID"))
-                    .WithCertificate(keyVaultService.GetCertificateAsync(ConfigHelper.GetVariable<string>("KeyVaultCertificateName")).Result, true)
-                    .WithTenantId(ConfigHelper.GetVariable<string>("PMETenantID"))
-                    .Build());
-
-
-            providers[CommonConstants.AuthenticationProviders.AZURE_COMMON_REPOSITORY_PROVIDER] = sp_pme_authProvider;
-            providers[CommonConstants.AuthenticationProviders.AZURE_STORAGE_PROVIDER] = sp_pme_authProvider;
-
-
-            services.AddScoped(typeof(ICaseRepository), ConfigHelper.GetVariable<Type>("TYPE_CASE_REPOSITORY", typeof(MockCaseRepository)));
-            services.AddScoped(typeof(BaseAiProvider), ConfigHelper.GetVariable<Type>("TYPE_AI_PROVIDER", typeof(MockAiProvider)));
-            services.AddScoped(typeof(BaseFileStore), ConfigHelper.GetVariable<Type>("TYPE_FILE_STORE_PROVIDER", typeof(LocalFileStore)));
-
-
-
-            services.AddSingleton<BaseBotInteraction>(new MockBotInteraction(
-                LoggerFactory.Create(loggingBuilder => loggingBuilder
-                      .SetMinimumLevel(Microsoft.Extensions.Logging.LogLevel.Debug)
-                      .AddConsole()).CreateLogger<IBotFrameworkHttpAdapter>(),
-                       "c:\\temp\\",
-                       ConfigHelper.GetVariable<string>("KustoClusterDnaisupportabilityIngest"),
-                       ConfigHelper.GetVariable<string>("CRIESCALATIONADVISOR_KUSTO_DB"),
-                       ConfigHelper.GetVariable<string>("SP_SUPPORTABILITY_CLIENT_ID"),
-                       keyVaultService,
-                       ConfigHelper.GetVariable<string>("LOGIN_ENDPOINT_URL"),
-                       ConfigHelper.GetVariable<string>("TenantID"),
-                       ConfigHelper.GetVariable<string>("KeyVaultCertificateName"),
-                       ConfigHelper.GetVariable<string>("PMETenantID")
-                    )
-                );
-
-            //var clientApplication = ConfidentialClientApplicationBuilder
-            //    .Create(ConfigHelper.GetVariable<string>("SP_SUPPORTABILITY_CLIENT_ID"))
-            //    .WithCertificate(keyVaultService.GetCertificateAsync(ConfigHelper.GetVariable<string>("KeyVaultCertificateName")).Result, true)
-            //    .WithTenantId(ConfigHelper.GetVariable<string>("PMETenantID"))
-            //    .Build();
-            services.AddSingleton<ISearchProvider, SearchProvider>(x =>
-               new SearchProvider(new ConfidentialClientAuthenticationProvider(sp_pme_authProvider.GetApplication() as IConfidentialClientApplication)));
-        }
-        else
-        {
-            // Initialize required AuthProviders for each service type using managed identity
-
-            var mi_authProvider = new ManagedIdentityAuthenticationProvider(managedIdentityApplication);
-            providers[CommonConstants.AuthenticationProviders.AZURE_COMMON_REPOSITORY_PROVIDER] = mi_authProvider;
-            providers[CommonConstants.AuthenticationProviders.AZURE_STORAGE_PROVIDER] = mi_authProvider;
-
-
-            services.AddScoped(typeof(ICaseRepository), ConfigHelper.GetVariable<Type>("TYPE_CASE_REPOSITORY", typeof(SqlCaseRepository)));
-            services.AddScoped(typeof(BaseAiProvider), ConfigHelper.GetVariable<Type>("TYPE_AI_PROVIDER", typeof(ZebraAiProvider)));
-            services.AddScoped(typeof(BaseFileStore), ConfigHelper.GetVariable<Type>("TYPE_FILE_STORE_PROVIDER", typeof(AzureStorageFileStore)));
-
-            services.AddSingleton<BaseBotInteraction>(
-              new BotInteraction(
-                  ConfigHelper.GetVariable<string>("STORAGECONTAINER_URL"),
-                  ConfigHelper.GetVariable<string>("ManagedIdentityId"),
-                  ConfigHelper.GetVariable<string>("TEAMS_CHANNEL_ID"),
-                  new SQLQueryExecutor(
-                      ConfigHelper.GetVariable<string>("SP_SUPPORTABILITY_CLIENT_ID"),
-                      keyVaultService,
-                      ConfigHelper.GetVariable<string>("LOGIN_ENDPOINT_URL"),
-                      ConfigHelper.GetVariable<string>("PMETenantID"),
-                      ConfigHelper.GetVariable<string>("KeyVaultCertificateName"),
-                      ConfigHelper.GetVariable<string>("PMETenantID")),
-                  ConfigHelper.GetVariable<string>("Server"),
-                  ConfigHelper.GetVariable<string>("DatabaseName"),
-                  new GptChatProviderV2(
-                      ConfigHelper.GetVariable<string>("CHAT_GPT_35_TURBO_URL"),
-                      new ManagedIdentityAuthenticationProvider(managedIdentityApplication),
-                      //new ConfidentialClientAuthenticationProvider(clientApplication),
-                      ConfigHelper.GetVariable<string>("GptScope")),
-                  new ManagedIdentityAuthenticationProvider(managedIdentityApplication),
-                  ConfigHelper.GetVariable<string>("Scope"),
-                  ConfigHelper.GetVariable<string>("completionsEndPoint"),
-                  ConfigHelper.GetVariable<string>("KustoserverAIingest"),
-                  ConfigHelper.GetVariable<string>("kustoDatabaseDnaicommondb"),
-                  ConfigHelper.GetVariable<string>("CRIESCALATIONADVISOR_KUSTO_DB"),
-                  ConfigHelper.GetVariable<string>("kustoTable"),
-                  LoggerFactory.Create(loggingBuilder => loggingBuilder
-                      .SetMinimumLevel(Microsoft.Extensions.Logging.LogLevel.Trace)
-                      .AddConsole()).CreateLogger<IBotFrameworkHttpAdapter>()
-              ));
-
-            services.AddSingleton<ISearchProvider, SearchProvider>(x =>
-               new SearchProvider(new ManagedIdentityAuthenticationProvider(managedIdentityApplication)));
-        }
-
-        services.AddSingleton<IDictionary<string, IAuthenticationProvider>>(providers);
-        services.AddSingleton<IAuthenticationProviderFactory, AuthenticationProviderFactory>();
-
-        services.AddScoped(typeof(ISummaryService), ConfigHelper.GetVariable<Type>("TYPE_SUMMARY_SERVICE", typeof(AiSummaryService)));
-
-        services.AddApplicationInsightsTelemetryWorkerService();
-        services.ConfigureFunctionsApplicationInsights();
-        services.AddHttpClient("nirvana", c =>
-        {
-            c.BaseAddress = new Uri(ConfigHelper.GetVariable<string>("NirvanaUri"));
-            c.DefaultRequestHeaders.Add("Authorization", "Bearer " + ConfigHelper.GetVariable<string>("NirvanaKey"));
-            c.DefaultRequestHeaders.Add("azureml-model-deployment", "green");
-        });
-        services.AddLogging();
-        services.AddHttpClient("qnaMaker", c =>
-        {
-            c.BaseAddress = new Uri(ConfigHelper.GetVariable<string>("QnaUri"));
-        });
-
-        services.AddHttpClient("qnaMakerV2", c =>
-        {
-            c.BaseAddress = new Uri(ConfigHelper.GetVariable<string>("QnaUriV2"));
-        });
-
-        services.AddHttpClient("bing", c =>
-        {
-            c.BaseAddress = new Uri(ConfigHelper.GetVariable<string>("BING_API_URL"));
-            c.DefaultRequestHeaders.Add("Ocp-Apim-Subscription-Key", ConfigHelper.GetVariable<string>("BING_OCP_APIM_SUBSCRIPTION_KEY"));
-        });
-
-        services.AddHttpClient("gpt");
-
-        services.AddSingleton<IKeyVaultHelperService, KeyVaultHelperService>(service => keyVaultService);
-
-        if (isDebugMode)
-        {
-            // Initialize client application for confidential client authentication
-            string clientId = ConfigHelper.GetVariable<string>("SP_SUPPORTABILITY_CLIENT_ID");
-            string tenantIdPME = ConfigHelper.GetVariable<string>("PMETenantID");
-            var clientApplicationPME = ConfidentialClientApplicationBuilder
-               .Create(clientId)
-               .WithCertificate(keyVaultService.GetCertificateAsync(ConfigHelper.GetVariable<string>("KeyVaultCertificateName")).Result, true)
-               .WithTenantId(tenantIdPME)
-               .Build();
-            services.AddSingleton<IAuthenticationProvider>(new ConfidentialClientAuthenticationProvider(clientApplicationPME));
-            services.AddSingleton<IGptChatProviderV2, GptChatProviderV2>(x =>
-               new GptChatProviderV2(ConfigHelper.GetVariable<string>("CHAT_GPT_4_MINI_URL"), new ConfidentialClientAuthenticationProvider(clientApplicationPME), ConfigHelper.GetVariable<string>("GptScope")));
-            services.AddSingleton<IGptCompletionProviderv2, GptCompletionProviderv2>(x =>
-           new GptCompletionProviderv2(ConfigHelper.GetVariable<string>("CHAT_GPT_35_TURBO_URL"), new ConfidentialClientAuthenticationProvider(clientApplicationPME), ConfigHelper.GetVariable<string>("GptScope")));
-            services.AddSingleton<IQnaProviderV2, QnaProviderV2>(x =>
-               new QnaProviderV2(new ConfidentialClientAuthenticationProvider(clientApplicationPME)));
-
-            services.AddSingleton<ICaseDataService, CaseDataService>(x =>
-                new CaseDataService(ConfigHelper.GetVariable<string>("SP_SUPPORTABILITY_CLIENT_ID"),
-                                    keyVaultService,
-                                    ConfigHelper.GetVariable<string>("LOGIN_ENDPOINT_URL"),
-                                    ConfigHelper.GetVariable<string>("TenantID"),
-                                    ConfigHelper.GetVariable<string>("KeyVaultCertificateName"),
-                                    new ConfidentialClientAuthenticationProvider(clientApplicationPME),
-
-                                    ConfigHelper.GetVariable<string>("CHAT_GPT_4_MINI_URL"),
-                                    ConfigHelper.GetVariable<string>("GptScope"),
-
-                                    ConfigHelper.GetVariable<string>("KustoserverAIingest"),
-                                    ConfigHelper.GetVariable<string>("KustoServerAI"),
-                                    ConfigHelper.GetVariable<string>("KustoDatabaseAI"),
-
-                                    ConfigHelper.GetVariable<string>("KustoTableAI"),
-                                    ConfigHelper.GetVariable<string>("KustoServerCase"),
-                                    ConfigHelper.GetVariable<string>("KustoDatabaseCase"),
-
-                                    null,
-                                    tenantIdPME));
-
-            services.AddSingleton<IAutoContentService, AutoContentService>(x =>
-             new AutoContentService(ConfigHelper.GetVariable<string>("SP_SUPPORTABILITY_CLIENT_ID"),
-                                 keyVaultService,
-                                 ConfigHelper.GetVariable<string>("LOGIN_ENDPOINT_URL"),
-                                 ConfigHelper.GetVariable<string>("TenantID"),
-                                 ConfigHelper.GetVariable<string>("KeyVaultCertificateName"),
-                                "https://dnaisupportability.eastus.kusto.windows.net",
-                                  "dnaicommondb_ppe",
-                                 null,
-                                 tenantIdPME));
-
-            services.AddSingleton<IIcMDataService, IcMDataService>(x =>
-               new IcMDataService(ConfigHelper.GetVariable<string>("SP_SUPPORTABILITY_CLIENT_ID"),
-                                   keyVaultService,
-                                   ConfigHelper.GetVariable<string>("LOGIN_ENDPOINT_URL"),
-                                   ConfigHelper.GetVariable<string>("TenantID"),
-                                   ConfigHelper.GetVariable<string>("KeyVaultCertificateName"),
-                                   new ConfidentialClientAuthenticationProvider(clientApplicationPME),
-
-                                   ConfigHelper.GetVariable<string>("CHAT_GPT_4_MINI_URL"),
-                                   ConfigHelper.GetVariable<string>("GptScope"),
-
-                                    ConfigHelper.GetVariable<string>("IcMKustoserverAIingest"), //: "https://ingest-dnaisupportability.eastus.kusto.windows.net",
-                                    ConfigHelper.GetVariable<string>("IcMKustoserverAI"),// : "https://dnaisupportability.eastus.kusto.windows.net",
-                                    ConfigHelper.GetVariable<string>("IcMKustoDatabaseAI_ppe"), // :"dnaicommondb_ppe",
-                                    ConfigHelper.GetVariable<string>("IcMKustoTableAI"),// : "IcMSummary",
-                                     ConfigHelper.GetVariable<string>("IcMDataWarehouseKustoServer"),//:  "https://dnaiicmfollower.centralus.kusto.windows.net",
-                                     ConfigHelper.GetVariable<string>("IcMDataWarehouse"),// : "IcMDataWarehouse",
-
-                                   null,
-                                   tenantIdPME));
-
-            string clientId2 = ConfigHelper.GetVariable<string>("ClientID");
-            string tenantId = ConfigHelper.GetVariable<string>("TenantID");
-            var options = new ClientCertificateCredentialOptions()
-            {
-                SendCertificateChain = true,
-            };
-            services.AddSingleton<TokenCredential>(identity => new ClientCertificateCredential(
-                                                              ConfigHelper.GetVariable<string>("PMETenantID"),
-                                                              clientId2,
-                                                              keyVaultService.GetCertificateAsync(ConfigHelper.GetVariable<string>("KeyVaultCertificateName")).Result,
-                                                              options));
-
-
-
-
-
-            if (environment == "Development")
-            {
-                //services.AddSingleton<IDataSource>(new MockDataSource(ConfigHelper.GetVariable<string>("MOCK_DATA_SOURCE_PATH", "c:/temp")));
-                services.AddSingleton<IDataSource>(provider => new KustoQueryExecutor(
-                                        ConfigHelper.GetVariable<string>("SP_SUPPORTABILITY_CLIENT_ID"),
-                                        keyVaultService,
-                                        ConfigHelper.GetVariable<string>("LOGIN_ENDPOINT_URL"),
-                                        ConfigHelper.GetVariable<string>("TenantID"),
-                                        ConfigHelper.GetVariable<string>("KeyVaultCertificateName"),
-                                        ConfigHelper.GetVariable<string>("PMETenantID")));
-            }
-            else
-            {
-                services.AddSingleton<IDataSource>(provider => new KustoQueryExecutor(
-                                                                    ConfigHelper.GetVariable<string>("SP_SUPPORTABILITY_CLIENT_ID"),
-                                                                    keyVaultService,
-                                                                    ConfigHelper.GetVariable<string>("LOGIN_ENDPOINT_URL"),
-                                                                    ConfigHelper.GetVariable<string>("TenantID"),
-                                                                    ConfigHelper.GetVariable<string>("KeyVaultCertificateName"),
-                                                                    ConfigHelper.GetVariable<string>("PMETenantID")));
-            }
-            services.AddSingleton<IPowerBIDatasetExecutor, PowerBIDatasetExecutor>(x => new PowerBIDatasetExecutor(keyVaultService));
-            services.AddSingleton<CaseAnalyzer>();
-
-        }
-        else
-        {
-            services.AddSingleton<IAuthenticationProvider>(new ManagedIdentityAuthenticationProvider(managedIdentityApplication));
-            services.AddSingleton<IGptChatProviderV2, GptChatProviderV2>(x =>
-               new GptChatProviderV2(ConfigHelper.GetVariable<string>("CHAT_GPT_4_MINI_URL"), new ManagedIdentityAuthenticationProvider(managedIdentityApplication), ConfigHelper.GetVariable<string>("GptScope")));
-            services.AddSingleton<IGptCompletionProviderv2, GptCompletionProviderv2>(x =>
-            new GptCompletionProviderv2(ConfigHelper.GetVariable<string>("CHAT_GPT_35_TURBO_URL"), new ManagedIdentityAuthenticationProvider(managedIdentityApplication), ConfigHelper.GetVariable<string>("GptScope")));
-            services.AddSingleton<IQnaProviderV2, QnaProviderV2>(x =>
-               new QnaProviderV2(new ManagedIdentityAuthenticationProvider(managedIdentityApplication)));
-
-            services.AddSingleton<ICaseDataService, CaseDataService>(x =>
-                new CaseDataService(ConfigHelper.GetVariable<string>("SP_SUPPORTABILITY_CLIENT_ID"),
-                                    keyVaultService,
-                                    ConfigHelper.GetVariable<string>("LOGIN_ENDPOINT_URL"),
-                                    ConfigHelper.GetVariable<string>("TenantID"),
-                                    ConfigHelper.GetVariable<string>("KeyVaultCertificateName"),
-                                    new ManagedIdentityAuthenticationProvider(managedIdentityApplication),
-
-                                     ConfigHelper.GetVariable<string>("CHAT_GPT_4_MINI_URL"),
-                                    ConfigHelper.GetVariable<string>("GptScope"),
-                                    ConfigHelper.GetVariable<string>("KustoserverAIingest"),
-                                    ConfigHelper.GetVariable<string>("KustoServerAI"),
-                                    ConfigHelper.GetVariable<string>("KustoDatabaseAI"),
-                                    ConfigHelper.GetVariable<string>("KustoTableAI"),
-                                    ConfigHelper.GetVariable<string>("KustoServerCase"),
-                                    ConfigHelper.GetVariable<string>("KustoDatabaseCase"),
-                                    ConfigHelper.GetVariable<string>("ManagedIdentityId"),
-                                    ConfigHelper.GetVariable<string>("PMETenantID")));
-
-            services.AddSingleton<IAutoContentService, AutoContentService>(x =>
-             new AutoContentService(ConfigHelper.GetVariable<string>("SP_SUPPORTABILITY_CLIENT_ID"),
-                                 keyVaultService,
-                                 ConfigHelper.GetVariable<string>("LOGIN_ENDPOINT_URL"),
-                                 ConfigHelper.GetVariable<string>("TenantID"),
-                                 ConfigHelper.GetVariable<string>("KeyVaultCertificateName"),
-                                 "https://dnaisupportability.eastus.kusto.windows.net",
-                                 "dnaicommondb_ppe",
-                                 ConfigHelper.GetVariable<string>("ManagedIdentityId"),
-                                 ConfigHelper.GetVariable<string>("PMETenantID")));
-
-            services.AddSingleton<IIcMDataService, IcMDataService>(x =>
-          new IcMDataService(ConfigHelper.GetVariable<string>("SP_SUPPORTABILITY_CLIENT_ID"),
-                              keyVaultService,
-                              ConfigHelper.GetVariable<string>("LOGIN_ENDPOINT_URL"),
-                              ConfigHelper.GetVariable<string>("TenantID"),
-                              ConfigHelper.GetVariable<string>("KeyVaultCertificateName"),
-                              new ManagedIdentityAuthenticationProvider(managedIdentityApplication),
-
-                              ConfigHelper.GetVariable<string>("CHAT_GPT_4_MINI_URL"),
-                              ConfigHelper.GetVariable<string>("GptScope"),
-
-                                     ConfigHelper.GetVariable<string>("IcMKustoserverAIingest"),
-                                     ConfigHelper.GetVariable<string>("IcMKustoserverAI"),
-                                     ConfigHelper.GetVariable<string>("IcMKustoDatabaseAI_ppe"),
-                                     ConfigHelper.GetVariable<string>("IcMKustoTableAI"),
-                                     ConfigHelper.GetVariable<string>("IcMDataWarehouseKustoServer"),
-                                     ConfigHelper.GetVariable<string>("IcMDataWarehouse"),
-
-                                     ConfigHelper.GetVariable<string>("ManagedIdentityId"),
-                                     ConfigHelper.GetVariable<string>("PMETenantID")));
-
-
-
-            if (environment == "Development")
-            {
-                //services.AddSingleton<IDataSource>(new MockDataSource(ConfigHelper.GetVariable<string>("MOCK_DATA_SOURCE_PATH", "c:/temp")));
-                services.AddSingleton<IDataSource>(provider => new KustoQueryExecutor(
-                                        ConfigHelper.GetVariable<string>("SP_SUPPORTABILITY_CLIENT_ID"),
-                                        keyVaultService,
-                                        ConfigHelper.GetVariable<string>("LOGIN_ENDPOINT_URL"),
-                                        ConfigHelper.GetVariable<string>("TenantID"),
-                                        ConfigHelper.GetVariable<string>("KeyVaultCertificateName"),
-                                        ConfigHelper.GetVariable<string>("PMETenantID")));
-            }
-            else
-            {
-                services.AddSingleton<IDataSource>(provider => new KustoQueryExecutor(ConfigHelper.GetVariable<string>("ManagedIdentityId")));
-            }
-
-            services.AddSingleton<IPowerBIDatasetExecutor, PowerBIDatasetExecutor>(x => new PowerBIDatasetExecutor(keyVaultService));
-
-            services.AddSingleton<TokenCredential>(identity => new ManagedIdentityCredential(
-                                                identityId));
-
-
-        }
-
-
-
-        services.AddTransient<IDataSource<ScoreRequestBody, ObjectResult>, QnaDataSource>();
-        services.AddTransient<IDataSource<ScoreRequestBody, ObjectResult>, NirvanaDataSource>();
-        services.AddTransient<IDataSource<ScoreRequestBody, ObjectResult>, BingDataSource>();
-        services.AddTransient<IProvider<QnaRequestBody>, SearchFrontend.Providers.QnAMaker.QnaProviderV2>();
-        services.AddTransient<IProvider<ScoreRequestBody>, NirvanaProvider>();
-        services.AddTransient<IProvider<ScoreRequestBody>, BingProvider>();
-        services.AddTransient<IProvider<QnaRequestBody>, BingProviderV2>();
-        services.AddTransient<IProvider<GptRequestBody>, GptProvider>();
-        services.AddTransient<IProvider<GptChatRequestBody>, SearchFrontend.Providers.GPT.GptChatProvider>();
-        services.AddTransient<SearchFrontend.Providers.QnAMaker.QnaProviderGetServiceList>();
-
-        services.AddTransient<IDataSource<GptRequestBody, string>, GptDataSource>();
-        services.AddTransient<IDataSource<GptChatRequestBody, string>, GptChatDataSource>();
-        services.AddTransient<IDataSource<QnaRequestBody, QnAAnswer>, SearchQnaDataSource>();
-        services.AddTransient<IDataSource<QnaRequestBody, QnAAnswer>, SearchBingDataSource>();
-
-        services.AddTransient<IAzureDevOpsProvider, AzureDevOpsProvider>();
-        services.AddTransient<IAzureDevOpsService, AzureDevOpsService>();
-
-        //add IOC required for case review processor
-        services.AddSingleton<SQLQueryExecutor>(new SQLQueryExecutor(ConfigHelper.GetVariable<string>("SP_SUPPORTABILITY_CLIENT_ID"),
-                      keyVaultService,
-                      ConfigHelper.GetVariable<string>("LOGIN_ENDPOINT_URL"),
-                      ConfigHelper.GetVariable<string>("TenantID"),
-                      ConfigHelper.GetVariable<string>("KeyVaultCertificateName"),
-                      ConfigHelper.GetVariable<string>("PMETenantID"))
-            );
-
-
-        services.AddSingleton<KustoQueryExecutor>(new KustoQueryExecutor(
-                    ConfigHelper.GetVariable<string>("SP_SUPPORTABILITY_CLIENT_ID"),
-                    keyVaultService,
-                    ConfigHelper.GetVariable<string>("LOGIN_ENDPOINT_URL"),
-                    ConfigHelper.GetVariable<string>("TenantID"),
-                    ConfigHelper.GetVariable<string>("KeyVaultCertificateName"),
-                    ConfigHelper.GetVariable<string>("PMETenantID")
-            )
-
-            );
-        
-        if (environment == "Development" || environment == "PPE") //enable only on PPE and Dev
-        {
-            services.AddTransient<CommonRepositoryContext>();
-        }
-
-        services.AddSingleton<CaseAnalyzer>();
-
-        services.AddScoped<ICaseLoader, CaseLoader>();
-        services.AddSingleton<ICaseUploader, SearchFrontend.Endpoints.GraphRAG.CaseUploader>();
-
-
+        config
+            .AddJsonFile("appsettings.json", optional: false, reloadOnChange: true)
+            .AddJsonFile($"appsettings.{context.HostingEnvironment.EnvironmentName}.json", optional: true, reloadOnChange: true)
+            .AddEnvironmentVariables()
+            .AddUserSecrets<Program>(optional: true);
     })
-    .ConfigureLogging(logging =>
+    .ConfigureServices((context, services) =>
     {
-        logging.Services.Configure<LoggerFilterOptions>(options =>
+        var configuration = context.Configuration;
+
+        // Configure options with validation
+        services.Configure<DatabaseOptions>(configuration.GetSection(DatabaseOptions.SectionName))
+            .AddSingleton<IValidateOptions<DatabaseOptions>, ValidateOptionsService<DatabaseOptions>>();
+
+        services.Configure<GraphRagOptions>(configuration.GetSection(GraphRagOptions.SectionName))
+            .AddSingleton<IValidateOptions<GraphRagOptions>, ValidateOptionsService<GraphRagOptions>>();
+
+        services.Configure<ProcessingOptions>(configuration.GetSection(ProcessingOptions.SectionName))
+            .AddSingleton<IValidateOptions<ProcessingOptions>, ValidateOptionsService<ProcessingOptions>>();
+
+        // Register core infrastructure services
+        services.AddSingleton<SQLQueryExecutor>();
+        services.AddSingleton<KustoQueryExecutor>();
+
+        // Register authentication and HTTP providers (these would need to be implemented)
+        services.AddScoped<IAuthenticationProvider, AuthenticationProvider>();
+        services.AddScoped<IGptChatProviderV2, GptChatProviderV2>();
+
+        // Register repositories
+        services.AddScoped<ICaseRepository, CaseRepository>();
+
+        // Register application services
+        services.AddScoped<IGraphRagService, GraphRagService>();
+        services.AddScoped<IAnalysisEngine, AnalysisEngine>();
+        services.AddScoped<IProcessingDecisionEngine, ProcessingDecisionEngine>();
+        services.AddScoped<IReportGenerator, ReportGenerator>();
+        services.AddScoped<IContentUploader, ContentUploader>();
+
+        // Configure logging
+        services.AddLogging(builder =>
         {
-            LoggerFilterRule defaultRule = options.Rules.FirstOrDefault(rule => rule.ProviderName
-                == "Microsoft.Extensions.Logging.ApplicationInsights.ApplicationInsightsLoggerProvider");
-            if (defaultRule is not null)
-            {
-                options.Rules.Remove(defaultRule);
-            }
-            var logLevel = ConfigHelper.GetVariable("LOG_LEVEL", "INFO");
-            // Add custom rule to capture Debug logs
-            options.Rules.Add(new LoggerFilterRule(
-                "Microsoft.Extensions.Logging.ApplicationInsights.ApplicationInsightsLoggerProvider",
-                null,  // Apply to all categories
-                (logLevel.Equals("DEBUG") ? Microsoft.Extensions.Logging.LogLevel.Debug : logLevel.Equals("INFO") ? Microsoft.Extensions.Logging.LogLevel.Information : logLevel.Equals("WARM") ? Microsoft.Extensions.Logging.LogLevel.Warning : logLevel.Equals("ERROR") ? Microsoft.Extensions.Logging.LogLevel.Error : Microsoft.Extensions.Logging.LogLevel.Information),  // Set minimum level to Debug
-                null)); // No filter function
+            builder.AddConsole();
+            builder.AddApplicationInsights();
+            builder.SetMinimumLevel(LogLevel.Information);
         });
+
+        // Add memory cache for performance optimization
+        services.AddMemoryCache();
+
+        // Add HTTP client factory
+        services.AddHttpClient();
+
+        // Health checks
+        services.AddHealthChecks()
+            .AddCheck<DatabaseHealthCheck>("database")
+            .AddCheck<GraphRagHealthCheck>("graphrag");
     })
     .Build();
 
 host.Run();
+
+// Supporting classes for dependency injection
+public class ValidateOptionsService<TOptions> : IValidateOptions<TOptions> where TOptions : class
+{
+    public ValidateOptionsResult Validate(string? name, TOptions options)
+    {
+        var validationContext = new ValidationContext(options);
+        var validationResults = new List<ValidationResult>();
+
+        if (Validator.TryValidateObject(options, validationContext, validationResults, true))
+        {
+            return ValidateOptionsResult.Success;
+        }
+
+        var errors = validationResults.Select(r => r.ErrorMessage).Where(e => e != null);
+        return ValidateOptionsResult.Fail(errors!);
+    }
+}
+
+// Placeholder implementations for missing services
+public class AuthenticationProvider : IAuthenticationProvider
+{
+    // Implementation would go here
+    public Task<string> GetTokenAsync() => Task.FromResult("mock-token");
+}
+
+public class AnalysisEngine : IAnalysisEngine
+{
+    private readonly ILogger<AnalysisEngine> _logger;
+
+    public AnalysisEngine(ILogger<AnalysisEngine> logger)
+    {
+        _logger = logger;
+    }
+
+    public async Task<SelfHelpGapAnalysis> PerformSelfHelpGapAnalysisAsync(
+        string rootDir, 
+        CancellationToken cancellationToken = default)
+    {
+        _logger.LogInformation("Performing self-help gap analysis for: {RootDir}", rootDir);
+        await Task.Delay(100, cancellationToken); // Placeholder
+        return new SelfHelpGapAnalysis();
+    }
+
+    public async Task<FMEAAnalysisResult> PerformFMEAAnalysisAsync(
+        string rootDir, 
+        CancellationToken cancellationToken = default)
+    {
+        _logger.LogInformation("Performing FMEA analysis for: {RootDir}", rootDir);
+        await Task.Delay(100, cancellationToken); // Placeholder
+        return new FMEAAnalysisResult();
+    }
+
+    public async Task PerformEntityRelationshipAnalysisAsync(
+        GraphRagAnalysisResult result, 
+        string outputDir, 
+        CancellationToken cancellationToken = default)
+    {
+        _logger.LogInformation("Performing entity relationship analysis for: {OutputDir}", outputDir);
+        await Task.Delay(100, cancellationToken); // Placeholder
+    }
+}
+
+public class ProcessingDecisionEngine : IProcessingDecisionEngine
+{
+    private readonly ILogger<ProcessingDecisionEngine> _logger;
+
+    public ProcessingDecisionEngine(ILogger<ProcessingDecisionEngine> logger)
+    {
+        _logger = logger;
+    }
+
+    public async Task<ProcessingDecision> MakeDecisionAsync(
+        IngestionRequest request, 
+        CancellationToken cancellationToken = default)
+    {
+        _logger.LogInformation("Making processing decision for ProductId: {ProductId}", request.ProductId);
+        await Task.Delay(100, cancellationToken); // Placeholder
+
+        return new ProcessingDecision
+        {
+            ShouldProcess = true,
+            Decision = "Process",
+            Reason = "New analysis requested",
+            Stats = new ProcessingStats
+            {
+                TotalCasesRequested = request.NumCasesToFetch
+            }
+        };
+    }
+}
+
+public class ReportGenerator : IReportGenerator
+{
+    private readonly ILogger<ReportGenerator> _logger;
+
+    public ReportGenerator(ILogger<ReportGenerator> logger)
+    {
+        _logger = logger;
+    }
+
+    public async Task GenerateReportsAsync(
+        GraphRagAnalysisResult result, 
+        IngestionRequest input, 
+        CancellationToken cancellationToken = default)
+    {
+        _logger.LogInformation("Generating reports for AnalysisId: {AnalysisId}", result.AnalysisId);
+        await Task.Delay(100, cancellationToken); // Placeholder
+    }
+}
+
+public class ContentUploader : IContentUploader
+{
+    private readonly ILogger<ContentUploader> _logger;
+
+    public ContentUploader(ILogger<ContentUploader> logger)
+    {
+        _logger = logger;
+    }
+
+    public async Task UploadAsync(string path, CancellationToken cancellationToken = default)
+    {
+        _logger.LogInformation("Uploading content from: {Path}", path);
+        await Task.Delay(100, cancellationToken); // Placeholder
+    }
+}
+
+// Health check implementations
+public class DatabaseHealthCheck : IHealthCheck
+{
+    private readonly ICaseRepository _caseRepository;
+    private readonly ILogger<DatabaseHealthCheck> _logger;
+
+    public DatabaseHealthCheck(ICaseRepository caseRepository, ILogger<DatabaseHealthCheck> logger)
+    {
+        _caseRepository = caseRepository;
+        _logger = logger;
+    }
+
+    public async Task<HealthCheckResult> CheckHealthAsync(
+        HealthCheckContext context, 
+        CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            // Simple health check - try to get a small number of cases
+            await _caseRepository.GetClosedCasesAsync("TEST", "", null, 1, 1, cancellationToken);
+            return HealthCheckResult.Healthy("Database is accessible");
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Database health check failed");
+            return HealthCheckResult.Unhealthy("Database is not accessible", ex);
+        }
+    }
+}
+
+public class GraphRagHealthCheck : IHealthCheck
+{
+    private readonly GraphRagOptions _options;
+    private readonly ILogger<GraphRagHealthCheck> _logger;
+
+    public GraphRagHealthCheck(IOptions<GraphRagOptions> options, ILogger<GraphRagHealthCheck> logger)
+    {
+        _options = options.Value;
+        _logger = logger;
+    }
+
+    public async Task<HealthCheckResult> CheckHealthAsync(
+        HealthCheckContext context, 
+        CancellationToken cancellationToken = default)
+    {
+        try
+        {
+            // Check if Python executable exists
+            if (!File.Exists(_options.PythonPath))
+            {
+                return HealthCheckResult.Unhealthy($"Python executable not found at: {_options.PythonPath}");
+            }
+
+            // Check if workspace directory is accessible
+            if (!Directory.Exists(_options.WorkspaceRoot))
+            {
+                Directory.CreateDirectory(_options.WorkspaceRoot);
+            }
+
+            await Task.Delay(10, cancellationToken); // Simulate async check
+            return HealthCheckResult.Healthy("GraphRAG components are accessible");
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "GraphRAG health check failed");
+            return HealthCheckResult.Unhealthy("GraphRAG components are not accessible", ex);
+        }
+    }
+}
