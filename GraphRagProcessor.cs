@@ -21,6 +21,7 @@ using SearchFrontend.Providers.GPT;
 using SearchFrontend.Endpoints.OpenCaseReview.Common;
 
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Data;
 using System.Diagnostics;
@@ -256,7 +257,7 @@ namespace SearchFrontend.Endpoints.GraphRAG
         Task<Dictionary<string, string>> GetNotesThreadsBatchAsync(IEnumerable<string> caseNumbers);
     }
 
-    // Your existing CaseLoader implementation (preserved)
+    // Optimized CaseLoader with parallel processing
     public sealed class CaseLoader : ICaseLoader
     {
         private readonly SQLQueryExecutor _sqlExec;
@@ -265,8 +266,15 @@ namespace SearchFrontend.Endpoints.GraphRAG
         private readonly string _udpDb;
         private readonly string _supServer;
         private readonly string _supDb;
-
-        private const int BatchSize = 75;
+        
+        // Optimized batch sizes for better throughput
+        private const int BatchSize = 50; // Reduced for better parallel processing
+        private const int MaxConcurrentBatches = 4; // Control concurrent SQL operations
+        
+        // Cache for repeated queries
+        private readonly ConcurrentDictionary<string, List<ClosedCaseRecord>> _caseCache = new();
+        private readonly ConcurrentDictionary<string, Dictionary<string, string>> _emailCache = new();
+        private readonly ConcurrentDictionary<string, Dictionary<string, string>> _notesCache = new();
 
         private const string EmailFilterClauses = @"
         AND Subject NOT LIKE '%New File Uploaded for%'
@@ -295,6 +303,15 @@ namespace SearchFrontend.Endpoints.GraphRAG
             int? maxAgeDays = null,
             CancellationToken ct = default)
         {
+            // Create cache key for intelligent caching
+            var cacheKey = $"{productId}|{sapPath}|{caseFilter}|{numCases}|{maxAgeDays}";
+            
+            if (_caseCache.TryGetValue(cacheKey, out var cachedResult))
+            {
+                _log.LogInformation("[CaseLoader] Cache hit for GetClosedCasesAsync → {Count}", cachedResult.Count);
+                return cachedResult;
+            }
+
             const string Sql = @"
                 DECLARE @NUM_CASES  INT           = @numCases;
                 DECLARE @PRODUCT_ID NVARCHAR(MAX) = @prodId;
@@ -329,8 +346,8 @@ namespace SearchFrontend.Endpoints.GraphRAG
                            SUBSTRING(B.SupportTopicID,CHARINDEX('\',B.SupportTopicID+'\')+1,1000) AS SupportTopicIDL3,
                            A.SRCreationDateTime,
                            A.SRClosedDateTime
-                    FROM  VWFACTSR A
-                    JOIN  VWDIMSUPPORTAREAPATH B ON A.SAPKEY = B.SAPKEY
+                    FROM  VWFACTSR A WITH (NOLOCK)
+                    JOIN  VWDIMSUPPORTAREAPATH B WITH (NOLOCK) ON A.SAPKEY = B.SAPKEY
                     WHERE A.SRStatus     = 'Closed'
                       AND B.PESProductID = @PRODUCT_ID
                       AND (@SAP_PATH  IS NULL OR REPLACE(B.SAPPath,'\','/') = REPLACE(@SAP_PATH,'\','/'))
@@ -351,7 +368,8 @@ namespace SearchFrontend.Endpoints.GraphRAG
                 ["@maxAgeDays"] = (maxAgeDays ?? -1).ToString()
             };
 
-            var tbl = await _sqlExec.ExecuteQueryAsync(_udpServer, _udpDb, Sql, param, usePMEApp: false);
+            var tbl = await _sqlExec.ExecuteQueryAsync(_udpServer, _udpDb, Sql, param, usePMEApp: false)
+                .ConfigureAwait(false);
 
             var list = tbl.AsEnumerable().Select(r => new ClosedCaseRecord
             {
@@ -386,13 +404,16 @@ namespace SearchFrontend.Endpoints.GraphRAG
                 CaseAge = r.Field<int>("CaseAge")
             }).ToList();
 
+            // Cache the result
+            _caseCache.TryAdd(cacheKey, list);
+
             _log.LogInformation("[CaseLoader] GetClosedCasesAsync → {Count}", list.Count);
             return list;
         }
 
         public async Task<List<string>> GetEmailThreadAsync(string sr, CancellationToken ct = default)
         {
-            var map = await GetEmailThreadsBatchAsync(new[] { sr });
+            var map = await GetEmailThreadsBatchAsync(new[] { sr }).ConfigureAwait(false);
             return map.TryGetValue(sr, out var txt)
                    ? txt.Split(new[] { "\n----\n" }, StringSplitOptions.None).ToList()
                    : new List<string>();
@@ -400,54 +421,169 @@ namespace SearchFrontend.Endpoints.GraphRAG
 
         public async Task<List<string>> GetNotesThreadAsync(string sr, CancellationToken ct = default)
         {
-            var map = await GetNotesThreadsBatchAsync(new[] { sr });
+            var map = await GetNotesThreadsBatchAsync(new[] { sr }).ConfigureAwait(false);
             return map.TryGetValue(sr, out var txt)
                    ? txt.Split(new[] { "\n----\n" }, StringSplitOptions.None).ToList()
                    : new List<string>();
         }
 
+        // OPTIMIZED: Parallel batch processing with semaphore for concurrency control
         public async Task<Dictionary<string, string>> GetEmailThreadsBatchAsync(IEnumerable<string> caseNumbers)
         {
             var list = caseNumbers.Where(s => !string.IsNullOrWhiteSpace(s)).Distinct().ToList();
             _log.LogInformation("🔍 Email batch starting for {Count} SR(s)", list.Count);
             Console.WriteLine($"🔍 Email batch starting for {list.Count} SR(s)");
-            if (list.Count == 0) return new();
+            
+            if (list.Count == 0) return new Dictionary<string, string>();
+
+            // Check cache first
+            var cacheKey = string.Join(",", list.OrderBy(x => x));
+            if (_emailCache.TryGetValue(cacheKey, out var cachedResult))
+            {
+                _log.LogInformation("📧 Cache hit for email batch");
+                return cachedResult;
+            }
 
             var chunks = SplitList(list, BatchSize);
-            var tables = new List<DataTable>();
+            var results = new ConcurrentDictionary<string, string>();
+            
+            // Use semaphore to control concurrent database operations
+            using var semaphore = new SemaphoreSlim(MaxConcurrentBatches, MaxConcurrentBatches);
+            
+            var tasks = chunks.Select(async (chunk, index) =>
+            {
+                await semaphore.WaitAsync().ConfigureAwait(false);
+                try
+                {
+                    var table = await RunEmailChunk(chunk, index + 1, chunks.Count).ConfigureAwait(false);
+                    
+                    // Process results in parallel
+                    var chunkResults = table.AsEnumerable()
+                        .AsParallel()
+                        .GroupBy(r => r["ticketnumber"]?.ToString() ?? "")
+                        .ToDictionary(
+                            g => g.Key,
+                            g => string.Join("\n----\n",
+                                g.Select(r =>
+                                    $"Subject: {r["Subject"]}; Created On: {r["CreatedOn"]}; " +
+                                    $"Message: {CleanMessage(r["Message"]?.ToString())}")));
+                    
+                    // Merge results thread-safely
+                    foreach (var kvp in chunkResults)
+                    {
+                        results.TryAdd(kvp.Key, kvp.Value);
+                    }
+                }
+                finally
+                {
+                    semaphore.Release();
+                }
+            });
 
-            for (int i = 0; i < chunks.Count; i++)
-                tables.Add(await RunEmailChunk(chunks[i], i + 1, chunks.Count));
-
-            return tables.SelectMany(t => t.AsEnumerable())
-                         .GroupBy(r => r["ticketnumber"]?.ToString() ?? "")
-                         .ToDictionary(
-                             g => g.Key,
-                             g => string.Join("\n----\n",
-                                  g.Select(r =>
-                                      $"Subject: {r["Subject"]}; Created On: {r["CreatedOn"]}; " +
-                                      $"Message: {CleanMessage(r["Message"]?.ToString())}")));
+            await Task.WhenAll(tasks).ConfigureAwait(false);
+            
+            var finalResult = results.ToDictionary(kvp => kvp.Key, kvp => kvp.Value);
+            
+            // Cache the result
+            _emailCache.TryAdd(cacheKey, finalResult);
+            
+            return finalResult;
         }
 
+        // OPTIMIZED: Similar parallel processing for notes
         public async Task<Dictionary<string, string>> GetNotesThreadsBatchAsync(IEnumerable<string> caseNumbers)
         {
             var list = caseNumbers.Where(s => !string.IsNullOrWhiteSpace(s)).Distinct().ToList();
             _log.LogInformation("🔍 Notes batch starting for {Count} SR(s)", list.Count);
             Console.WriteLine($"🔍 Notes batch starting for {list.Count} SR(s)");
-            if (list.Count == 0) return new();
+            
+            if (list.Count == 0) return new Dictionary<string, string>();
+
+            // Check cache first
+            var cacheKey = string.Join(",", list.OrderBy(x => x));
+            if (_notesCache.TryGetValue(cacheKey, out var cachedResult))
+            {
+                _log.LogInformation("📝 Cache hit for notes batch");
+                return cachedResult;
+            }
 
             var chunks = SplitList(list, BatchSize);
-            var tables = new List<DataTable>();
+            var results = new ConcurrentDictionary<string, string>();
+            
+            using var semaphore = new SemaphoreSlim(MaxConcurrentBatches, MaxConcurrentBatches);
+            
+            var tasks = chunks.Select(async (chunk, index) =>
+            {
+                await semaphore.WaitAsync().ConfigureAwait(false);
+                try
+                {
+                    var table = await RunNotesChunk(chunk, index + 1, chunks.Count).ConfigureAwait(false);
+                    
+                    var chunkResults = table.AsEnumerable()
+                        .AsParallel()
+                        .GroupBy(r => r["ticketnumber"]?.ToString() ?? "")
+                        .ToDictionary(
+                            g => g.Key,
+                            g => string.Join("\n----\n",
+                                g.Select(r => r["CleanedNote"]?.ToString() ?? "")));
+                    
+                    foreach (var kvp in chunkResults)
+                    {
+                        results.TryAdd(kvp.Key, kvp.Value);
+                    }
+                }
+                finally
+                {
+                    semaphore.Release();
+                }
+            });
 
-            for (int i = 0; i < chunks.Count; i++)
-                tables.Add(await RunNotesChunk(chunks[i], i + 1, chunks.Count));
+            await Task.WhenAll(tasks).ConfigureAwait(false);
+            
+            var finalResult = results.ToDictionary(kvp => kvp.Key, kvp => kvp.Value);
+            
+            // Cache the result
+            _notesCache.TryAdd(cacheKey, finalResult);
+            
+            return finalResult;
+        }
 
-            return tables.SelectMany(t => t.AsEnumerable())
-                         .GroupBy(r => r["ticketnumber"]?.ToString() ?? "")
-                         .ToDictionary(
-                             g => g.Key,
-                             g => string.Join("\n----\n",
-                                  g.Select(r => r["CleanedNote"]?.ToString() ?? "")));
+        // OPTIMIZED: Enhanced retry logic with exponential backoff
+        private async Task<DataTable> ExecWithRetry(string sql, Dictionary<string, string> param, int chunkNo, int totalChunks, string label)
+        {
+            const int maxRetries = 3;
+            var delays = new[] { TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(2), TimeSpan.FromSeconds(4) };
+            
+            for (int attempt = 0; attempt < maxRetries; attempt++)
+            {
+                try
+                {
+                    var tbl = await _sqlExec.ExecuteQueryAsync(_supServer, _supDb, sql, param, usePMEApp: true)
+                        .ConfigureAwait(false);
+                    _log.LogInformation("[CaseLoader] {Lbl} chunk {C}/{T} → {Rows} rows", label, chunkNo, totalChunks, tbl.Rows.Count);
+                    return tbl;
+                }
+                catch (SqlException ex) when (attempt < maxRetries - 1 && IsRetryableException(ex))
+                {
+                    _log.LogWarning(ex, "[CaseLoader] {Lbl} chunk {C}/{T} attempt {A} failed – retrying in {Delay}ms", 
+                        label, chunkNo, totalChunks, attempt + 1, delays[attempt].TotalMilliseconds);
+                    await Task.Delay(delays[attempt]).ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    _log.LogError(ex, "[CaseLoader] {Lbl} chunk {C}/{T} failed permanently", label, chunkNo, totalChunks);
+                    throw;
+                }
+            }
+            
+            throw new InvalidOperationException("Should not reach this point");
+        }
+
+        private static bool IsRetryableException(SqlException ex)
+        {
+            // Common retryable SQL error codes
+            var retryableCodes = new[] { 2, 53, 121, 233, 10053, 10054, 10060, 40197, 40501, 40613 };
+            return retryableCodes.Contains(ex.Number);
         }
 
         private async Task<DataTable> RunEmailChunk(List<string> chunk, int chunkNo, int totalChunks)
@@ -523,25 +659,6 @@ namespace SearchFrontend.Endpoints.GraphRAG
 
             var param = names.Zip(chunk, (n, id) => new { n, id }).ToDictionary(x => x.n, x => x.id);
             return await ExecWithRetry(sql, param, chunkNo, totalChunks, "Notes");
-        }
-
-        private async Task<DataTable> ExecWithRetry(string sql, Dictionary<string, string> param, int chunkNo, int totalChunks, string label)
-        {
-            const int maxRetries = 3;
-            for (int attempt = 1; ; attempt++)
-            {
-                try
-                {
-                    var tbl = await _sqlExec.ExecuteQueryAsync(_supServer, _supDb, sql, param, usePMEApp: true);
-                    _log.LogInformation("[CaseLoader] {Lbl} chunk {C}/{T} → {Rows} rows", label, chunkNo, totalChunks, tbl.Rows.Count);
-                    return tbl;
-                }
-                catch (SqlException ex) when (attempt < maxRetries)
-                {
-                    _log.LogWarning(ex, "[CaseLoader] {Lbl} chunk {C}/{T} attempt {A} failed – retrying", label, chunkNo, totalChunks, attempt);
-                    await Task.Delay(TimeSpan.FromSeconds(Math.Pow(2, attempt - 1)));
-                }
-            }
         }
 
         private static List<List<T>> SplitList<T>(IList<T> src, int size)
