@@ -53,6 +53,7 @@ namespace SearchFrontend.Endpoints.GraphRAG
         public bool SaveToAzureDataExplorer { get; set; } = false;
         public bool ForceReindex { get; set; } = false;
         public string UpdateStrategy { get; set; } = "track";
+        public int? MaxEmailsPerCase { get; set; } = null; // null = all emails, number = limit
     }
 
     // Analysis result models
@@ -699,7 +700,7 @@ namespace SearchFrontend.Endpoints.GraphRAG
                     return analysisResult;
                 }
 
-                var docs = await BuildCaseDocumentsAsync(records);
+                var docs = await BuildCaseDocumentsAsync(records, input);
 
                 // ===== NEW SECTION START =====
                 // Make intelligent processing decision
@@ -813,14 +814,14 @@ namespace SearchFrontend.Endpoints.GraphRAG
                 input.MaxAgeDays);
         }
 
-        private async Task<List<CaseDocument>> BuildCaseDocumentsAsync(List<ClosedCaseRecord> records)
+        private async Task<List<CaseDocument>> BuildCaseDocumentsAsync(List<ClosedCaseRecord> records, IngestionRequest input)
         {
-            var tasks = records.Select(r => FetchCaseDocumentAsync(r));
+            var tasks = records.Select(r => FetchCaseDocumentAsync(r, input));
             var docs = await Task.WhenAll(tasks);
             return docs.ToList();
         }
 
-        private async Task<CaseDocument> FetchCaseDocumentAsync(ClosedCaseRecord rec)
+        private async Task<CaseDocument> FetchCaseDocumentAsync(ClosedCaseRecord rec, IngestionRequest input)
         {
             try
             {
@@ -850,7 +851,10 @@ Idle Days: {rec.CaseIdleDays} case, {rec.CommunicationIdleDays} communication
 
                 if (emails.Any())
                 {
-                    customerProblems += "CUSTOMER COMMUNICATIONS:\n" + string.Join("\n---\n", emails.Take(3)) + "\n\n";
+                    var emailsToInclude = input.MaxEmailsPerCase.HasValue 
+                        ? emails.Take(input.MaxEmailsPerCase.Value) 
+                        : emails;
+                    customerProblems += "CUSTOMER COMMUNICATIONS:\n" + string.Join("\n---\n", emailsToInclude) + "\n\n";
                 }
 
                 if (notes.Any())
